@@ -66,43 +66,77 @@
     - Connected via nRF Connect (iPhone + PC),
     - Verified periodic Notify packets; data matched expected mock pattern.
 - Issues:
-    - Observed ~50 ms jitter in Notify timing (to investigate later).
+    - Observed ~50 ms jitter in Notify timing (noted for later investigation).
 
 ---
 
 # 2025-03-24 - ML Model Research (Research)
 
 - Surveyed EMG classification papers:
-    - Focused on architectures suited for low-resource MCUs,
-    - Key reference: Vasconez et al. (2022) - EMG-IMU + CNN,
-    - Compared feature-engineered methods vs. end-to-end CNNs.
-- Noted STM32WB resource limits (1 MB Flash, 256 KB RAM) likely constrain CNN usage.
+    - Focused on low-resource architectures for embedded systems,
+    - Key reference: Vasconez et al. (2022) - CNN-based EMG classification,
+    - Compared CNNs, RNNs, and feature-based MLPs.
+- Identified STM32WB5MMG resource constraints:
+    - 1 MB Flash, 256 KB RAM → tight for large models,
+    - Need ≤ 200 KB quantized model size for practical deployment.
+- Planned to prototype a small CNN first to benchmark feasibility.
 
 # 2025-03-27 - CNN Prototype (Implementation & Testing)
 
-- Implemented CNN on PC (Python + Keras):
-    - 2 Conv layers (ReLU) + Dense + Softmax,
-    - Input: 4-channel EMG, 2 sec @ 2 kHz = (4 × 4000) samples.
-- Accuracy: ~85% (single-subject, 30 trials),
-- Model size: ~300 KB quantized → too large for STM32WB.
-- Logged findings and pivot plan:
-    - Explore feature-based model next,
-    - Focus on minimizing Flash + RAM footprint.
+- **Model 1: Small CNN**
+    - Architecture:
+        - Input: (4 channels × 4000 samples),
+        - Conv1D (32 filters, kernel=5) → ReLU,
+        - Conv1D (64 filters, kernel=5) → ReLU,
+        - Flatten → Dense (50) → Softmax (6 classes).
+    - Accuracy: ~85% (30 trials, single user),
+    - Model size:
+        - ~1.2 MB (float32),
+        - ~300 KB (after full quantization).
+- Issues:
+    - STM32WB5MMG could not fit 300 KB fully quantized model,
+    - Overfitting observed despite dropout (0.2).
+- Decision:
+    - Too large; planned to test a smaller CNN next.
 
 ---
 
-# 2025-03-31 - Feature Model Dev (Implementation)
+# 2025-03-29 - CNN Lite Experiment (Implementation & Testing)
 
-- Designed new ML pipeline:
-    - Per channel: Mean, Std Dev, RMS, MAV, Zero Crossings,
-    - 4 channels × 5 features = 20D input vector.
-- PC-side code:
-    - `compute_features(emg_data)` to extract features,
-    - Keras classifier: 2 Dense layers (50 neurons each) + Softmax output.
-- Results:
-    - ~90% accuracy (30 trials, single user),
-    - Model size ~180 KB (quantized), acceptable for MCU.
-- Documented next step: embed feature extraction code into STM32 firmware.
+- **Model 2: Lite CNN**
+    - Architecture:
+        - Input: (4 channels × 4000 samples),
+        - Conv1D (16 filters, kernel=3) → ReLU,
+        - GlobalMaxPooling1D,
+        - Dense (30) → ReLU → Dropout(0.2),
+        - Softmax (6 classes).
+    - Accuracy: ~81%,
+    - Model size:
+        - ~550 KB (float32),
+        - ~150 KB (quantized).
+- Notes:
+    - Fit within MCU constraints,
+    - But accuracy trade-off (~9% lower).
+
+---
+
+# 2025-03-31 - Feature-Based MLP (Implementation)
+
+- **Model 3: Feature-Based MLP**
+    - Feature extraction (per channel):
+        - Mean, Std Dev, RMS, MAV, Zero Crossings,
+    - Input: 20D vector (5 features × 4 channels),
+    - Architecture:
+        - Dense (50) → ReLU + BatchNorm + Dropout(0.2),
+        - Dense (50) → ReLU + BatchNorm + Dropout(0.2),
+        - Softmax (6 classes).
+    - Accuracy: ~90% (30 trials),
+    - Model size:
+        - ~480 KB (float32),
+        - ~110 KB (quantized).
+- Advantages:
+    - Small, fast, deployable,
+    - Outperformed CNNs in accuracy and size balance.
 
 # 2025-04-02 - Hardware Integration (Implementation & Testing)
 
@@ -127,24 +161,48 @@
     - Live EMG data on PC (RealTerm + Python),
     - Sampling rate: stable at 2 kHz.
 - Debugging:
-    - First run: saw incorrect data alignment (fixed by adjusting SPI word size),
-    - Added `printf` logs + toggled debug LED for data-ready check.
+    - Initial bug: data alignment issue (fixed SPI word size),
+    - Added `printf` logs via **USART2 (UART peripheral)** to output raw values for verification,
+    - Config: USART2 at 115200 bps, 8N1 (PA2/PA3),
+    - Used logic analyzer to verify SPI signals.
 
 # 2025-04-07 - BLE Debugging (Debugging)
 
-- BLE began hanging at `APP_BLE_Init()`,
-    - RTC, RF, IPCC initialized,
-    - System stalled at `aci_gap_init()`.
-- Added debug LED blink after each init step to trace progress.
-- Hypothesis: BLE stack binary corrupted.
-- Shifted focus: prioritized USB-CDC logging as **main method** moving forward.
+- BLE stack began hanging at `APP_BLE_Init()`.
+- **USART2 Debug Setup:**
+    - Added `__io_putchar()` retarget for printf:
+    ```c
+    int __io_putchar(int ch)
+    {
+        HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, HAL_MAX_DELAY);
+        return ch;
+    }
+    ```
+    - Printed checkpoints:
+        - `"RTC Init Done"`,
+        - `"RF Init Done"`,
+        - `"IPCC Init Done"`,
+        - `"aci_gap_init() Start"`.
+    - Used RealTerm to confirm serial output.
+- **Breakpoints & Stepping:**
+    - Set breakpoints at:
+        - `APP_BLE_Init()`,
+        - `SHCI_C2_BLE_Init()`,
+        - `aci_gap_init()`,
+    - Stepped through using STM32CubeIDE: stuck after `aci_gap_init()`.
+- Debug LEDs:
+    - Toggled PB0 LED after each init step,
+    - LED froze after BLE stack call → confirmed stall point.
+- Conclusion:
+    - BLE stack binary corruption likely; pivoted to USB-CDC as primary path.
 
 ---
 
 # 2025-04-10 - P2P Validation (Debugging & Verification)
 
-- Flashed official STM32 P2P Server example (unmodified),
-    - Result: BLE still hung at `aci_gap_init()`.
+- Flashed official STM32 P2P Server example,
+    - USART2 logs + breakpoints showed identical failure point,
+    - Confirmed BLE stack binary issue (vendor side).
 - Confirmed BLE stack binary was faulty (not an app-side bug).
 - Documented issue + planned to continue with USB-CDC only until vendor fix.
 
